@@ -1,0 +1,48 @@
+{
+    "name": "syncrecord/watch-php",
+    "description": "PHP client for Sync Record Watch: errors, logs, performance, outside API calls, jobs, deploys, heartbeats and vulnerable packages.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["monitoring", "error-tracking", "logging", "apm", "performance", "watch"],
+    "homepage": "https://github.com/SyncRecord-B-V/watch-php",
+    "authors": [
+        {
+            "name": "SyncRecord B.V."
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5 || ^11.0"
+    },
+    "suggest": {
+        "ext-curl": "Preferred HTTP transport (falls back to PHP streams without it)",
+        "ext-zlib": "Gzip-compresses what is sent to Watch",
+        "psr/log": "Use Watch::logger() as a real Psr\\Log\\LoggerInterface (Adapter\\Psr3Logger)",
+        "psr/http-server-middleware": "PSR-15 middleware that names and times requests (Adapter\\Psr15Middleware)",
+        "psr/http-client": "PSR-18 client decorator that times outgoing calls (Adapter\\Psr18Client)",
+        "guzzlehttp/guzzle": "Guzzle middleware that times outgoing calls (Adapter\\GuzzleMiddleware)"
+    },
+    "autoload": {
+        "psr-4": {
+            "SyncRecord\\Watch\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "SyncRecord\\Watch\\Tests\\": "tests/"
+        }
+    },
+    "bin": [
+        "bin/watch"
+    ],
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}

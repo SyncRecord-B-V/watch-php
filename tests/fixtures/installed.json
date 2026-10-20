@@ -1,0 +1,18 @@
+{
+    "packages": [
+        {
+            "name": "symfony/framework-bundle",
+            "version": "v7.2.4",
+            "version_normalized": "7.2.4.0",
+            "type": "symfony-bundle"
+        },
+        {
+            "name": "psr/log",
+            "version": "3.0.2",
+            "version_normalized": "3.0.2.0",
+            "type": "library"
+        }
+    ],
+    "dev": false,
+    "dev-package-names": []
+}

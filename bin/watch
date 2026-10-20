@@ -1,0 +1,46 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/*
+ * vendor/bin/watch: test, deploy, ping, dependencies, config, flush.
+ * Finds the project's vendor/autoload.php (Composer's bin proxy tells us; else look upward).
+ */
+
+$watchAutoload = null;
+if (isset($GLOBALS['_composer_autoload_path']) && is_string($GLOBALS['_composer_autoload_path'])) {
+    $watchAutoload = $GLOBALS['_composer_autoload_path'];
+} else {
+    $watchStarts = [__DIR__];
+    $watchCwd = getcwd();
+    if ($watchCwd !== false) {
+        $watchStarts[] = $watchCwd;
+    }
+    foreach ($watchStarts as $watchDir) {
+        for ($i = 0; $i < 10 && $watchAutoload === null; $i++) {
+            if (is_file($watchDir . '/vendor/autoload.php')) {
+                $watchAutoload = $watchDir . '/vendor/autoload.php';
+                break;
+            }
+            $watchParent = dirname($watchDir);
+            if ($watchParent === $watchDir) {
+                break;
+            }
+            $watchDir = $watchParent;
+        }
+        if ($watchAutoload !== null) {
+            break;
+        }
+    }
+}
+
+if ($watchAutoload === null || !is_file($watchAutoload)) {
+    fwrite(STDERR, "watch: could not find vendor/autoload.php (run composer install first)\n");
+    exit(1);
+}
+
+require $watchAutoload;
+
+$watchArgv = $_SERVER['argv'] ?? [];
+exit((new \SyncRecord\Watch\Cli())->run(is_array($watchArgv) ? array_values(array_map('strval', $watchArgv)) : []));
