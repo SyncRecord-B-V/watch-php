@@ -238,7 +238,7 @@ final class ErrorReport
      */
     private static function requestInfo(Filter $filter, Request $request): array
     {
-        $params = Json::safe(array_replace($request->query, $request->body));
+        $params = Json::safe(array_replace($request->query, $request->body), $filter);
         $params = is_array($params) ? $filter->apply($params) : [];
         if ((Json::bytes($params) ?? PHP_INT_MAX) > self::MAX_SECTION_BYTES) {
             $params = ['_truncated' => true];
@@ -269,7 +269,7 @@ final class ErrorReport
     {
         $out = [];
         foreach ($server as $key => $value) {
-            if (!is_string($key) || !str_starts_with($key, 'HTTP_')) {
+            if (!is_string($key) || !str_starts_with($key, 'HTTP_') || strlen($key) > Json::MAX_KEY_BYTES) {
                 continue;
             }
             $parts = explode('_', substr($key, 5));
@@ -447,7 +447,7 @@ final class ErrorReport
      */
     private static function context(Filter $filter, Scope $scope, array $context): ?array
     {
-        $extra = Json::safe(array_replace($scope->context, $context));
+        $extra = Json::safe(array_replace($scope->context, $context), $filter);
         $out = is_array($extra) && $extra !== [] ? $filter->apply($extra) : [];
         if ((Json::bytes($out) ?? PHP_INT_MAX) > self::MAX_CONTEXT_BYTES) {
             $out = ['_truncated' => true];

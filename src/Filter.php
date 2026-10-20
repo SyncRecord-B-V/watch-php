@@ -53,8 +53,13 @@ final class Filter
         try {
             return $this->map($data, null, null, 0);
         } catch (\Throwable) {
-            // Never send unfiltered data because a rule failed.
-            return array_map(static fn (): string => self::FILTERED, $data);
+            // Never send unfiltered data (or an oversized name) because a rule failed.
+            $out = [];
+            foreach ($data as $key => $_) {
+                $out[is_string($key) && strlen($key) > Json::MAX_KEY_BYTES ? Json::KEY_TOO_LONG : $key] = self::FILTERED;
+            }
+
+            return $out;
         }
     }
 
@@ -150,6 +155,10 @@ final class Filter
         foreach ($data as $key => $value) {
             if ($isList && $parentKey !== null) {
                 $out[$key] = $this->value($parentKey, $value, (string) $parentFull, $depth, true);
+                continue;
+            }
+            if (is_string($key) && strlen($key) > Json::MAX_KEY_BYTES) {
+                $out[Json::KEY_TOO_LONG] = '[TRUNCATED]';
                 continue;
             }
             $name = (string) $key;

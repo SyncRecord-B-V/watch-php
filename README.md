@@ -68,11 +68,21 @@ How delivery works:
   finished first (`fastcgi_finish_request()`), so visitors never wait for Watch.
 - **CLI scripts and long-running workers** (queue workers, RoadRunner, Swoole, FrankenPHP worker mode).
   Logs and numbers stay in memory and are sent every 10 seconds or 500 log lines, and when the script ends.
-  Call `Watch::flush()` between jobs in a worker loop.
+  Call `Watch::flush()` between jobs in a worker loop. Installed Composer packages are reported at the first
+  flush and then once a day, also without a spool directory (a small `<spool dir>-state` folder remembers
+  it, so a cron script that runs every minute doesn't report every minute).
+- **Concurrent requests in one process** (Swoole, OpenSwoole). Each coroutine gets its own request, user,
+  route, context and breadcrumbs, so overlapping requests never mix their data; coroutines started inside a
+  request (`go()`) count for that request. Other runtimes that run
+  requests side by side in one process (fibers, ReactPHP, AMPHP) are not isolated automatically: tell
+  Watch the request ID with `Client::resolveContextWith(fn () => $currentRequestId)` and call
+  `Watch::client()->releaseContext()` when each request is done (in a `finally`, so failed requests are
+  released too). The PSR-15 middleware already releases every request it handles.
 - **No writable spool directory.** Logs and numbers are sent at the end of each request instead.
 
 Failed sends are retried (on 408, 425, 429 and 5xx answers and network errors). Spool files wait for the
-next try; files older than 1 hour, or a spool over 20 MB, are deleted.
+next try; files older than 1 hour, or a spool over 20 MB, are deleted. Sending the spool stops after 15
+seconds in total (each try only gets the time that is left); whatever was not sent stays for the next run.
 
 ## Configuration
 
@@ -432,7 +442,11 @@ vendor/bin/watch dependencies
 - Metrics: up to 300 routes, 100 hosts and 200 job classes per minute.
 - Spool: one file per kind and minute (up to 5 MB each), files older than 1 hour or a spool over 20 MB are
   deleted.
-- Network: 2 s to connect, 5 s in total.
+- Context, log fields and breadcrumb data: copied up to 2,000 values, 256 KB of text and 20 levels deep
+  (the rest becomes `[TRUNCATED]` or `[TOO DEEP]`), so a huge or self-referencing value can't use up memory.
+  Filtered keys are replaced before their value is read. Field names over 256 bytes are dropped with
+  their value (one `[KEY TOO LONG]` marker), never cut.
+- Network: 2 s to connect, 5 s in total; sending the spool stops after 15 s.
 
 ## Troubleshooting
 

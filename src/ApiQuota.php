@@ -72,7 +72,8 @@ final class ApiQuota
     {
         $out = [];
         foreach ($headers as $name => $value) {
-            if (!is_string($name)) {
+            // Quota headers have short names: never lowercase (copy) an oversized one.
+            if (!is_string($name) || strlen($name) > Json::MAX_KEY_BYTES) {
                 continue;
             }
             if (is_array($value)) {

@@ -10,6 +10,7 @@ interface TransportInterface
      * Sends one JSON object to a Watch API path ("/api/v1/logs"). Never throws.
      *
      * @param array<string, mixed> $payload
+     * @param float|null $timeout at most this many seconds for the whole request (null: the configured timeout)
      */
-    public function post(string $path, array $payload): Result;
+    public function post(string $path, array $payload, ?float $timeout = null): Result;
 }

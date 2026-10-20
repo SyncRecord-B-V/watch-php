@@ -11,6 +11,7 @@ interface HttpSender
 {
     /**
      * @param array<string, string> $headers
+     * @param float|null $timeout at most this many seconds (never more than the sender's own timeout)
      */
-    public function send(string $url, array $headers, string $body): HttpResponse;
+    public function send(string $url, array $headers, string $body, ?float $timeout = null): HttpResponse;
 }

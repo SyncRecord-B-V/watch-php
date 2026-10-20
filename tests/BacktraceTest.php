@@ -89,7 +89,6 @@ final class BacktraceTest extends TestCase
     private function makeException(): \RuntimeException
     {
         $this->exceptionLine = __LINE__ + 1;
-
         return new \RuntimeException('boom');
     }
 }

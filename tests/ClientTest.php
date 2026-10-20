@@ -26,15 +26,17 @@ final class ClientTest extends TestCase
 
     protected function tearDown(): void
     {
-        if (!is_dir($this->dir)) {
-            return;
-        }
-        foreach (scandir($this->dir) ?: [] as $name) {
-            if (is_file($this->dir . '/' . $name)) {
-                unlink($this->dir . '/' . $name);
+        foreach ([$this->dir, $this->dir . '-state'] as $dir) {
+            if (!is_dir($dir)) {
+                continue;
             }
+            foreach (scandir($dir) ?: [] as $name) {
+                if (is_file($dir . '/' . $name)) {
+                    unlink($dir . '/' . $name);
+                }
+            }
+            rmdir($dir);
         }
-        rmdir($this->dir);
     }
 
     public function testCliSendsErrorsAtOnce(): void
@@ -236,6 +238,155 @@ final class ClientTest extends TestCase
         $this->assertTrue($this->webClient()->sendSpool());
         $this->assertCount(1, $this->transport->payloads(Transport::METRICS));
         $this->assertSame([], $spool->dueFiles('metrics'));
+    }
+
+    public function testConcurrentRequestsKeepTheirOwnUserAndUrl(): void
+    {
+        $context = 'a';
+        Client::resolveContextWith(static function () use (&$context): string {
+            return $context;
+        });
+        try {
+            $client = $this->cliClient();
+            $client->beginRequest($this->httpRequest('/orders/1'));
+            $client->setUser('user-a');
+            $client->addContext(['tenant' => 'a']);
+
+            $context = 'b';
+            $client->beginRequest($this->httpRequest('/invoices/2'));
+            $client->setUser('user-b');
+            $client->addContext(['tenant' => 'b']);
+
+            $context = 'a';
+            $client->notify(new \RuntimeException('in request a'));
+            $context = 'c'; // a context that never began a request: no one else's data
+            $client->notify(new \RuntimeException('outside any request'));
+        } finally {
+            Client::resolveContextWith(null);
+        }
+
+        $errors = array_merge(...array_column($this->transport->payloads(Transport::ERRORS), 'errors'));
+        $this->assertCount(2, $errors);
+        $this->assertSame('user-a', $errors[0]['user_id']);
+        $this->assertStringContainsString('/orders/1', $errors[0]['request']['url']);
+        $this->assertSame(['tenant' => 'a'], $errors[0]['context']);
+        $this->assertArrayNotHasKey('user_id', array_filter($errors[1], static fn ($value): bool => $value !== null));
+        $this->assertArrayNotHasKey('request', array_filter($errors[1], static fn ($value): bool => $value !== null));
+    }
+
+    public function testFinishedRequestContextsAreReleased(): void
+    {
+        $context = 'main-loop';
+        Client::resolveContextWith(static function () use (&$context): string {
+            return $context;
+        });
+        try {
+            $client = $this->cliClient();
+            $before = $client->contextCount();
+            for ($i = 0; $i < 1000; $i++) {
+                $context = 'request-' . $i;
+                $client->beginRequest($this->httpRequest('/orders/' . $i));
+                try {
+                    $client->setUser('user-' . $i);
+                    if ($i % 2 === 0) {
+                        throw new \RuntimeException('request ' . $i . ' failed');
+                    }
+                    $client->endRequest(200);
+                } catch (\RuntimeException) {
+                    $client->endRequest(500);
+                } finally {
+                    $client->releaseContext();
+                }
+            }
+
+            $this->assertSame($before, $client->contextCount());
+
+            // Code that runs after the release (an outer error handler logging) doesn't store a new state.
+            $client->log('error', 'logged by an outer handler');
+            $client->setUser('late');
+            $this->assertSame($before, $client->contextCount());
+        } finally {
+            Client::resolveContextWith(null);
+        }
+    }
+
+    public function testAWorkerForgetsTheFinishedRequest(): void
+    {
+        $client = $this->cliClient();
+        $client->beginRequest($this->httpRequest('/orders/1'));
+        $client->setUser('user-1');
+        $client->endRequest(200);
+        $client->releaseContext();
+        $client->notify(new \RuntimeException('between requests'));
+
+        $errors = array_merge(...array_column($this->transport->payloads(Transport::ERRORS), 'errors'));
+        $this->assertCount(1, $errors);
+        $this->assertNull($errors[0]['user_id'] ?? null);
+        $this->assertNull($errors[0]['request'] ?? null);
+    }
+
+    public function testSpoolSendingStopsAtTheBudgetAndKeepsTheRest(): void
+    {
+        $spool = new Spool($this->dir);
+        $spool->usable();
+        $records = [];
+        for ($i = 0; $i < 5; $i++) {
+            $records[] = ['message' => 'line ' . $i];
+        }
+        $spool->append('logs', $records, time() - 180);
+
+        $now = 1000.0;
+        $this->transport->onPost = static function () use (&$now): void {
+            $now += 6.0; // every send takes 6 seconds
+        };
+        $config = Config::fromArray([
+            'url' => 'https://watch.example.com', 'api_key' => 'lh_example', 'environment' => 'production',
+            'root' => '/var/www/app', 'spool_dir' => $this->dir, 'report_dependencies' => false,
+            'finish_request' => false, 'batch_size' => 1,
+        ], []);
+        $client = new Client($config, $this->transport, new Spool($this->dir), $this->httpRequest('/'), false,
+            static function () use (&$now): float {
+                return $now;
+            });
+
+        $this->assertTrue($client->sendSpool());
+        // 15 s budget, 6 s per batch: 3 batches start (at 0, 6 and 12 s), never a fourth.
+        $sent = $this->transport->payloads(Transport::LOGS);
+        $this->assertCount(3, $sent);
+        $this->assertLessThan(15.0, $this->transport->posts[2]['timeout'] ?? 99.0);
+        // The rest stays in the spool for the next request.
+        $files = $spool->dueFiles('logs');
+        $this->assertCount(1, $files);
+        $this->assertSame(['line 3', 'line 4'], array_column($spool->read($files[0]), 'message'));
+    }
+
+    public function testCliAppsReportDependenciesWithoutASpool(): void
+    {
+        $config = Config::fromArray([
+            'url' => 'https://watch.example.com', 'api_key' => 'lh_example', 'environment' => 'production',
+            'root' => __DIR__ . '/fixtures/app', 'spool_dir' => $this->dir, 'report_dependencies' => true,
+        ], []);
+        // The CLI never creates the spool directory ($this->dir doesn't exist).
+        $cli = new Request(['argv' => ['worker.php']], [], [], [], false);
+        $client = new Client($config, $this->transport, new Spool($this->dir), $cli, true);
+        $client->log('error', 'first job failed');
+        $client->flush();
+        $client->flush();
+
+        $this->assertCount(1, $this->transport->payloads(Transport::DEPENDENCIES));
+        $this->assertSame('composer', $this->transport->payloads(Transport::DEPENDENCIES)[0]['ecosystem']);
+        $this->assertDirectoryDoesNotExist($this->dir);
+
+        // The next run of the script (a new process) remembers it: a cron job doesn't report every run.
+        $nextRun = new Client($config, $this->transport, new Spool($this->dir), $cli, true);
+        $nextRun->flush();
+        $this->assertCount(1, $this->transport->payloads(Transport::DEPENDENCIES));
+        $this->assertDirectoryExists($this->dir . '-state');
+    }
+
+    private function httpRequest(string $uri): Request
+    {
+        return new Request(['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => $uri, 'HTTP_HOST' => 'shop.example.com'], [], [], [], true);
     }
 
     /**

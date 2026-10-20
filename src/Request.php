@@ -36,6 +36,15 @@ final class Request
         return new self($_SERVER, $_GET, $_POST, $_COOKIE);
     }
 
+    /**
+     * No request: for code that runs outside one (a new coroutine before beginRequest()), so it
+     * never borrows another request's data.
+     */
+    public static function detached(): self
+    {
+        return new self([], [], [], [], false);
+    }
+
     public function isHttp(): bool
     {
         if ($this->http !== null) {

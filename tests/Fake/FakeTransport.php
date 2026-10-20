@@ -12,8 +12,11 @@ use SyncRecord\Watch\TransportInterface;
  */
 final class FakeTransport implements TransportInterface
 {
-    /** @var list<array{path: string, payload: array<string, mixed>}> */
+    /** @var list<array{path: string, payload: array<string, mixed>, timeout: float|null}> */
     public array $posts = [];
+
+    /** @var (callable(string, array<string, mixed>): void)|null called on every post (tests move a fake clock with it) */
+    public $onPost = null;
 
     /** @var list<Result> */
     private array $results = [];
@@ -27,9 +30,12 @@ final class FakeTransport implements TransportInterface
         return $this;
     }
 
-    public function post(string $path, array $payload): Result
+    public function post(string $path, array $payload, ?float $timeout = null): Result
     {
-        $this->posts[] = ['path' => $path, 'payload' => $payload];
+        $this->posts[] = ['path' => $path, 'payload' => $payload, 'timeout' => $timeout];
+        if ($this->onPost !== null) {
+            ($this->onPost)($path, $payload);
+        }
 
         return array_shift($this->results) ?? Result::ok(202);
     }

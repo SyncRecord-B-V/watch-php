@@ -170,7 +170,7 @@ final class LogEntry
         if ($exception instanceof \Throwable) {
             unset($context['exception']);
         }
-        $fields = Json::safe($context);
+        $fields = Json::safe($context, $filter);
         $fields = is_array($fields) ? $fields : [];
         if ($exception instanceof \Throwable) {
             $fields['exception'] = [
@@ -191,7 +191,7 @@ final class LogEntry
     private static function scopeFields(Filter $filter, Scope $scope): array
     {
         $out = [];
-        $context = Json::safe($scope->context);
+        $context = Json::safe($scope->context, $filter);
         if (is_array($context) && $context !== []) {
             foreach ($filter->apply($context) as $key => $value) {
                 $out[(string) $key] = is_scalar($value) || $value === null ? $value : Json::encode($value);

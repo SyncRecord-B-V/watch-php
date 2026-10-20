@@ -44,7 +44,7 @@ final class Transport implements TransportInterface
         return 'watch-php/' . Watch::VERSION . ' php/' . PHP_VERSION;
     }
 
-    public function post(string $path, array $payload): Result
+    public function post(string $path, array $payload, ?float $timeout = null): Result
     {
         try {
             $url = rtrim((string) $this->config->url, '/') . $path;
@@ -69,7 +69,7 @@ final class Transport implements TransportInterface
                 }
             }
 
-            return self::classify($this->sender->send($url, $headers, $body));
+            return self::classify($this->sender->send($url, $headers, $body, $timeout));
         } catch (\Throwable $error) {
             return Result::drop('send failed: ' . $error->getMessage());
         }

@@ -9,6 +9,7 @@ use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\MiddlewareInterface;
 use Psr\Http\Server\RequestHandlerInterface;
 use SyncRecord\Watch\Client;
+use SyncRecord\Watch\Json;
 use SyncRecord\Watch\Request;
 use SyncRecord\Watch\Watch;
 
@@ -30,19 +31,28 @@ final class Psr15Middleware implements MiddlewareInterface
         }
         $this->begin($client, $request);
         try {
-            $response = $handler->handle($request);
-        } catch (\Throwable $error) {
-            $this->fail($client, $error);
+            try {
+                $response = $handler->handle($request);
+            } catch (\Throwable $error) {
+                $this->fail($client, $error);
 
-            throw $error;
-        }
-        try {
-            $client->endRequest($response->getStatusCode());
-        } catch (\Throwable) {
-            // Never break the response.
-        }
+                throw $error;
+            }
+            try {
+                $client->endRequest($response->getStatusCode());
+            } catch (\Throwable) {
+                // Never break the response.
+            }
 
-        return $response;
+            return $response;
+        } finally {
+            // Done (also after an exception): a long-running server must not keep this request's state.
+            try {
+                $client->releaseContext();
+            } catch (\Throwable) {
+                // Never break the response.
+            }
+        }
     }
 
     private function begin(Client $client, ServerRequestInterface $request): void
@@ -125,6 +135,9 @@ final class Psr15Middleware implements MiddlewareInterface
             $server['HTTPS'] = 'on';
         }
         foreach ($request->getHeaders() as $name => $values) {
+            if (strlen((string) $name) > Json::MAX_KEY_BYTES) {
+                continue;
+            }
             $key = 'HTTP_' . strtoupper(str_replace('-', '_', (string) $name));
             if (!isset($server[$key])) {
                 $server[$key] = implode(', ', $values);

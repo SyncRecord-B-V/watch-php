@@ -13,10 +13,10 @@ final class StreamSender implements HttpSender
     {
     }
 
-    public function send(string $url, array $headers, string $body): HttpResponse
+    public function send(string $url, array $headers, string $body, ?float $timeout = null): HttpResponse
     {
         try {
-            return $this->perform($url, $headers, $body);
+            return $this->perform($url, $headers, $body, $timeout);
         } catch (\Throwable $error) {
             return new HttpResponse(0, '', 'request failed: ' . $error->getMessage());
         }
@@ -25,8 +25,9 @@ final class StreamSender implements HttpSender
     /**
      * @param array<string, string> $headers
      */
-    private function perform(string $url, array $headers, string $body): HttpResponse
+    private function perform(string $url, array $headers, string $body, ?float $timeout): HttpResponse
     {
+        $limit = $timeout === null ? $this->timeout : max(0.5, min($this->timeout, $timeout));
         $lines = [];
         foreach ($headers as $name => $value) {
             $lines[] = $name . ': ' . $value;
@@ -38,7 +39,7 @@ final class StreamSender implements HttpSender
                 'method' => 'POST',
                 'header' => implode("\r\n", $lines),
                 'content' => $body,
-                'timeout' => $this->timeout,
+                'timeout' => $limit,
                 'ignore_errors' => true,
                 'follow_location' => 0,
             ],

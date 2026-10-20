@@ -19,10 +19,10 @@ final class CurlSender implements HttpSender
     ) {
     }
 
-    public function send(string $url, array $headers, string $body): HttpResponse
+    public function send(string $url, array $headers, string $body, ?float $timeout = null): HttpResponse
     {
         try {
-            return $this->perform($url, $headers, $body);
+            return $this->perform($url, $headers, $body, $timeout);
         } catch (\Throwable $error) {
             $this->handle = null;
 
@@ -33,8 +33,9 @@ final class CurlSender implements HttpSender
     /**
      * @param array<string, string> $headers
      */
-    private function perform(string $url, array $headers, string $body): HttpResponse
+    private function perform(string $url, array $headers, string $body, ?float $timeout): HttpResponse
     {
+        $limit = $timeout === null ? $this->timeout : max(0.5, min($this->timeout, $timeout));
         $handle = $this->handle();
         if ($handle === null) {
             return new HttpResponse(0, '', 'curl_init failed');
@@ -56,8 +57,8 @@ final class CurlSender implements HttpSender
             CURLOPT_HEADER => false,
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_NOSIGNAL => true,
-            CURLOPT_CONNECTTIMEOUT_MS => (int) round($this->connectTimeout * 1000),
-            CURLOPT_TIMEOUT_MS => (int) round($this->timeout * 1000),
+            CURLOPT_CONNECTTIMEOUT_MS => (int) round(min($this->connectTimeout, $limit) * 1000),
+            CURLOPT_TIMEOUT_MS => (int) round($limit * 1000),
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
         ];

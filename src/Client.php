@@ -23,6 +23,8 @@ final class Client
     public const MAX_WARNINGS = 100;
     /** Most seconds one request spends sending spool files. */
     private const SEND_BUDGET = 15.0;
+    /** Below this many seconds left of the send budget, no new request is started. */
+    private const MIN_SEND_TIME = 0.5;
     /** Wait after a failed spool send before the next try. */
     private const RETRY_AFTER = 60;
 
@@ -31,8 +33,6 @@ final class Client
     private readonly Spool $spool;
     private readonly bool $web;
     private readonly bool $bufferMode;
-    private Request $request;
-    private Scope $scope;
     private Metrics $metrics;
     private ?Handlers $handlers = null;
     /** @var list<array<string, mixed>> */
@@ -41,17 +41,28 @@ final class Client
     private array $logs = [];
     /** @var \WeakMap<\Throwable, bool> */
     private \WeakMap $reported;
-    /** @var array<string, int> */
-    private array $warnings = [];
     private float $lastFlush;
-    private ?float $serverStart;
-    private int|float $startHr;
-    private bool $requestRecorded = false;
-    private bool $uncaught = false;
-    private bool $uncaughtReported = false;
     private bool $finished = false;
     private bool $shutDown = false;
-    private bool $sending = false;
+    /** How many sends are running (a counter: coroutines can overlap their sends). */
+    private int $sending = 0;
+    /** @var (\Closure(): string)|null replaces the context lookup (tests; other concurrent runtimes) */
+    private static ?\Closure $contextResolver = null;
+
+    /**
+     * Request state per context: one for a normal PHP process, one per coroutine in Swoole /
+     * OpenSwoole (removed when the coroutine ends).
+     *
+     * @var array<string, RequestState>
+     */
+    private array $states = [];
+
+    /** @var array<string, true> coroutine contexts whose cleanup is already registered */
+    private array $deferred = [];
+    /** @var \Closure(): float seconds, like microtime(true) (tests pass a fake clock) */
+    private \Closure $clock;
+    /** When dependencies were last reported by this process (no spool to keep it in), or null. */
+    private ?int $dependenciesSentAt = null;
 
     public function __construct(
         private readonly Config $config,
@@ -59,19 +70,25 @@ final class Client
         ?Spool $spool = null,
         ?Request $request = null,
         ?bool $bufferMode = null,
+        ?\Closure $clock = null,
     ) {
+        $this->clock = $clock ?? static fn (): float => microtime(true);
         $this->filter = new Filter($config->filterKeys);
         $this->transport = $transport ?? new Transport($config);
         $this->spool = $spool ?? new Spool($config->spoolDir);
-        $this->request = $request ?? Request::fromGlobals();
-        $this->web = $this->request->isHttp();
+        $request ??= Request::fromGlobals();
+        $this->web = $request->isHttp();
         $this->bufferMode = $bufferMode ?? $config->workerMode ?? (!$this->web || Request::isWorkerProcess());
         $this->metrics = new Metrics();
         $this->reported = new \WeakMap();
         $this->lastFlush = microtime(true);
-        $this->serverStart = $this->bufferMode ? null : $this->request->startTime();
-        $this->startHr = hrtime(true);
-        $this->scope = $this->newScope($this->web);
+        $this->setState(new RequestState(
+            $request,
+            new Scope(),
+            $this->bufferMode ? null : $request->startTime(),
+            hrtime(true),
+        ));
+        $this->state()->scope = $this->newScope($this->web);
     }
 
     public function install(): void
@@ -87,7 +104,7 @@ final class Client
 
     public function scope(): Scope
     {
-        return $this->scope;
+        return $this->state()->scope;
     }
 
     public function filter(): Filter
@@ -110,7 +127,7 @@ final class Client
      */
     public function isSending(): bool
     {
-        return $this->sending;
+        return $this->sending > 0;
     }
 
     /**
@@ -153,8 +170,8 @@ final class Client
                 $this->config,
                 $this->filter,
                 $error,
-                $this->scope,
-                $this->request,
+                $this->state()->scope,
+                $this->state()->request,
                 $handled,
                 $context,
                 $component,
@@ -171,8 +188,8 @@ final class Client
      */
     public function reportUncaught(\Throwable $error): void
     {
-        $this->uncaught = true;
-        $this->uncaughtReported = true;
+        $this->state()->uncaught = true;
+        $this->state()->uncaughtReported = true;
         $this->notify($error, [], false);
     }
 
@@ -184,15 +201,15 @@ final class Client
     public function reportFatal(array $error): void
     {
         try {
-            $this->uncaught = true;
+            $this->state()->uncaught = true;
             $message = is_string($error['message'] ?? null) ? $error['message'] : '';
-            if ($this->uncaughtReported && str_starts_with($message, 'Uncaught ')) {
+            if ($this->state()->uncaughtReported && str_starts_with($message, 'Uncaught ')) {
                 return;
             }
             if (!$this->config->sendErrors) {
                 return;
             }
-            $this->queueError(ErrorReport::fromFatal($this->config, $this->filter, $error, $this->scope, $this->request));
+            $this->queueError(ErrorReport::fromFatal($this->config, $this->filter, $error, $this->state()->scope, $this->state()->request));
         } catch (\Throwable $failure) {
             Diagnostics::log('could not report a fatal error: ' . $failure->getMessage());
         }
@@ -209,15 +226,15 @@ final class Client
                 return; // Fatal unless handled elsewhere: reported at shutdown.
             }
             $key = $type . ':' . $file . ':' . $line;
-            if (isset($this->warnings[$key])) {
-                $this->warnings[$key]++;
+            if (isset($this->state()->warnings[$key])) {
+                $this->state()->warnings[$key]++;
 
                 return;
             }
-            if (count($this->warnings) >= self::MAX_WARNINGS) {
+            if (count($this->state()->warnings) >= self::MAX_WARNINGS) {
                 return;
             }
-            $this->warnings[$key] = 1;
+            $this->state()->warnings[$key] = 1;
             $location = Backtrace::relative($file, $this->config->root) . ':' . $line;
             $this->log('warn', self::phpErrorLabel($type) . ': ' . $message, [
                 'php_error' => ErrorReport::errorName($type),
@@ -245,7 +262,7 @@ final class Client
             if (!$this->config->sendLogs || $index < $this->config->minLevelIndex()) {
                 return;
             }
-            $entry = LogEntry::build($this->config, $this->filter, $name, $message, $context, $this->scope);
+            $entry = LogEntry::build($this->config, $this->filter, $name, $message, $context, $this->state()->scope);
             if ($this->config->beforeSend !== null) {
                 $entry = ($this->config->beforeSend)($entry);
                 if (!is_array($entry)) {
@@ -277,11 +294,11 @@ final class Client
                 'message' => Text::cutChars(Text::clean($message, 4096), 300),
             ];
             $metadata = array_filter($metadata, static fn ($value): bool => $value !== null);
-            $safe = $metadata === [] ? [] : Json::safe($metadata);
+            $safe = $metadata === [] ? [] : Json::safe($metadata, $this->filter);
             if (is_array($safe) && $safe !== []) {
                 $crumb['metadata'] = $this->filter->apply($safe);
             }
-            $this->scope->addBreadcrumb($crumb, $this->config->breadcrumbsMax);
+            $this->state()->scope->addBreadcrumb($crumb, $this->config->breadcrumbsMax);
         } catch (\Throwable) {
             // Breadcrumbs are best effort.
         }
@@ -289,13 +306,13 @@ final class Client
 
     public function setRoute(string $route): void
     {
-        $this->scope->route = Text::presence($route, 255);
+        $this->state()->scope->route = Text::presence($route, 255);
     }
 
     public function setUser(string|int|null $id, ?string $email = null): void
     {
-        $this->scope->userId = Text::presence($id, 100);
-        $this->scope->userEmail = Text::presence($email, 200);
+        $this->state()->scope->userId = Text::presence($id, 100);
+        $this->state()->scope->userEmail = Text::presence($email, 200);
     }
 
     /**
@@ -303,7 +320,7 @@ final class Client
      */
     public function addContext(array $fields): void
     {
-        $this->scope->context = array_replace($this->scope->context, $fields);
+        $this->state()->scope->context = array_replace($this->state()->scope->context, $fields);
     }
 
     /**
@@ -324,10 +341,10 @@ final class Client
         try {
             $ms = is_finite($ms) && $ms > 0 ? $ms : 0.0;
             $host = Text::cutChars(strtolower(trim($host)), 255);
-            $this->scope->httpMs += $ms;
+            $this->state()->scope->httpMs += $ms;
             if ($this->config->performance && $host !== '') {
                 $quotas = $headers === [] ? [] : ApiQuota::parse($headers);
-                $this->metrics->recordHttp($host, $ms, $status, $failure, $quotas, $this->scope->jobClass);
+                $this->metrics->recordHttp($host, $ms, $status, $failure, $quotas, $this->state()->scope->jobClass);
             }
             $target = $url !== null ? (string) $this->filter->url($url) : $host;
             $outcome = $status !== null ? (string) $status : (string) $failure;
@@ -341,9 +358,9 @@ final class Client
     public function recordQuery(float $ms): void
     {
         if (is_finite($ms) && $ms > 0) {
-            $this->scope->dbMs += $ms;
+            $this->state()->scope->dbMs += $ms;
         }
-        $this->scope->queries++;
+        $this->state()->scope->queries++;
     }
 
     /**
@@ -352,7 +369,7 @@ final class Client
      */
     public function job(string $name, callable $work, ?string $queue = null): mixed
     {
-        $previous = $this->scope;
+        $previous = $this->state()->scope;
         $jobClass = Text::cutChars(trim($name), 255);
         $start = hrtime(true);
         try {
@@ -360,7 +377,7 @@ final class Client
             $scope->jobClass = $jobClass === '' ? 'UnnamedJob' : $jobClass;
             $scope->jobId = Request::newId();
             $scope->queue = Text::presence($queue, 100);
-            $this->scope = $scope;
+            $this->state()->scope = $scope;
         } catch (\Throwable) {
             // Run the job anyway.
         }
@@ -383,17 +400,15 @@ final class Client
     public function beginRequest(Request $request): void
     {
         try {
-            $this->request = $request;
             if (!$this->bufferMode) {
+                $this->state()->request = $request;
+
                 return;
             }
-            $this->scope = $this->newScope(true);
-            $this->requestRecorded = false;
-            $this->uncaught = false;
-            $this->uncaughtReported = false;
-            $this->warnings = [];
-            $this->serverStart = null;
-            $this->startHr = hrtime(true);
+            // A fresh state for this request's context: nothing of an earlier (or concurrent) request
+            // carries over.
+            $this->setState(new RequestState($request, new Scope(), null, hrtime(true)));
+            $this->state()->scope = $this->newScope(true);
         } catch (\Throwable $failure) {
             Diagnostics::log('could not start a request: ' . $failure->getMessage());
         }
@@ -405,12 +420,12 @@ final class Client
     public function endRequest(?int $status = null): void
     {
         try {
-            if ($this->requestRecorded || !$this->scope->isRequest) {
+            if ($this->state()->recorded || !$this->state()->scope->isRequest) {
                 return;
             }
-            $this->requestRecorded = true;
+            $this->state()->recorded = true;
             $code = $status ?? Request::status();
-            if ($this->uncaught && $code < 500) {
+            if ($this->state()->uncaught && $code < 500) {
                 $code = 500;
             }
             $ms = $this->durationMs();
@@ -420,10 +435,10 @@ final class Client
                     $endpoint,
                     $ms,
                     $code,
-                    $this->scope->dbMs,
+                    $this->state()->scope->dbMs,
                     0.0,
-                    $this->scope->httpMs,
-                    $this->scope->queries,
+                    $this->state()->scope->httpMs,
+                    $this->state()->scope->queries,
                 );
             }
             if ($this->config->logRequests) {
@@ -463,7 +478,10 @@ final class Client
                     $this->finishResponse();
                 }
                 $this->flushBuffers();
-                $this->maybeReportDependencies();
+                if (!$this->bufferMode) {
+                    // (In buffer mode flushBuffers already did.)
+                    $this->maybeReportDependencies();
+                }
 
                 return;
             }
@@ -491,17 +509,19 @@ final class Client
         if (!$this->spool->usable(false) || !$this->spool->acquireSenderLock()) {
             return null;
         }
-        $this->sending = true;
+        $this->sending++;
+        $counted = true;
         try {
             $now = time();
-            $deadline = microtime(true) + self::SEND_BUDGET;
+            $deadline = ($this->clock)() + self::SEND_BUDGET;
             $this->spool->cleanup($now);
             $ok = $this->sendSpoolKind('metrics', $now, $deadline) && $this->sendSpoolKind('logs', $now, $deadline);
             if (!$ok) {
                 $this->spool->deferSend(self::RETRY_AFTER, $now);
             }
-            $this->sending = false;
-            $this->maybeReportDependencies();
+            $this->sending--;
+            $counted = false;
+            $this->maybeReportDependencies($deadline);
 
             return $ok;
         } catch (\Throwable $failure) {
@@ -509,7 +529,9 @@ final class Client
 
             return false;
         } finally {
-            $this->sending = false;
+            if ($counted) {
+                $this->sending--;
+            }
             $this->spool->releaseSenderLock();
         }
     }
@@ -518,8 +540,8 @@ final class Client
     {
         try {
             $ms = (hrtime(true) - $start) / 1e6;
-            $scope = $this->scope;
-            $this->scope = $previous;
+            $scope = $this->state()->scope;
+            $this->state()->scope = $previous;
             if ($this->config->performance && $scope->jobClass !== null) {
                 $this->metrics->recordJob(
                     $scope->jobClass,
@@ -534,7 +556,7 @@ final class Client
             }
             $this->afterRecord();
         } catch (\Throwable $failure) {
-            $this->scope = $previous;
+            $this->state()->scope = $previous;
             Diagnostics::log('could not record a job: ' . $failure->getMessage());
         }
     }
@@ -577,11 +599,11 @@ final class Client
             return $scope;
         }
         $scope->isRequest = true;
-        $scope->requestId = $this->request->requestId();
-        $this->scope = $scope;
-        $this->breadcrumb('request', Request::endpoint($this->request->method(), $this->request->path()), [
-            'method' => $this->request->method(),
-            'path' => $this->filter->url($this->request->pathWithQuery()),
+        $scope->requestId = $this->state()->request->requestId();
+        $this->state()->scope = $scope;
+        $this->breadcrumb('request', Request::endpoint($this->state()->request->method(), $this->state()->request->path()), [
+            'method' => $this->state()->request->method(),
+            'path' => $this->filter->url($this->state()->request->pathWithQuery()),
         ]);
 
         return $scope;
@@ -589,7 +611,7 @@ final class Client
 
     private function afterRecord(): void
     {
-        if (!$this->bufferMode || $this->sending) {
+        if (!$this->bufferMode || $this->sending > 0) {
             return;
         }
         $due = count($this->logs) >= $this->config->batchSize
@@ -597,6 +619,146 @@ final class Client
         if ($due) {
             $this->flushBuffers();
         }
+    }
+
+    /**
+     * The state of the request running in this context. A context without one (a new coroutine that
+     * didn't call beginRequest) gets an empty one, never another request's.
+     */
+    private function state(): RequestState
+    {
+        $key = self::contextKey();
+        if (isset($this->states[$key])) {
+            return $this->states[$key];
+        }
+        // A coroutine started inside a request (go() in a controller) works for that request.
+        $parent = self::parentContextKey();
+        if ($parent !== null && isset($this->states[$parent])) {
+            return $this->states[$parent];
+        }
+        $detached = new RequestState(Request::detached(), new Scope(), null, hrtime(true));
+        // A custom context (resolveContextWith) only keeps what beginRequest() stored: code that runs
+        // after releaseContext() (an outer error handler logging) must not store a state nobody frees.
+        if (str_starts_with($key, 'ctx:')) {
+            return $detached;
+        }
+
+        return $this->setState($detached);
+    }
+
+    /**
+     * Sets this context's state; a new coroutine's state is dropped when the coroutine ends.
+     */
+    private function setState(RequestState $state): RequestState
+    {
+        $key = self::contextKey();
+        $this->states[$key] = $state;
+        $this->forgetWhenDone($key);
+
+        return $state;
+    }
+
+    private static function parentContextKey(): ?string
+    {
+        if (self::$contextResolver !== null) {
+            return null;
+        }
+        foreach (['Swoole\\Coroutine', 'OpenSwoole\\Coroutine'] as $class) {
+            if (class_exists($class, false) && method_exists($class, 'getPcid')) {
+                $id = $class::getPcid();
+
+                return is_int($id) && $id > 0 ? 'co:' . $id : null;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * "main" in a normal PHP process; the coroutine in Swoole / OpenSwoole, where many requests run
+     * in one process at the same time.
+     */
+    private static function contextKey(): string
+    {
+        if (self::$contextResolver !== null) {
+            return 'ctx:' . (string) (self::$contextResolver)();
+        }
+        foreach (['Swoole\\Coroutine', 'OpenSwoole\\Coroutine'] as $class) {
+            if (class_exists($class, false)) {
+                $id = $class::getCid();
+                if (is_int($id) && $id > 0) {
+                    return 'co:' . $id;
+                }
+            }
+        }
+
+        return 'main';
+    }
+
+    /**
+     * Drops a coroutine's state when the coroutine ends, so a long-running server doesn't keep them.
+     * Registered once per coroutine (a keep-alive connection runs many requests in one coroutine).
+     */
+    private function forgetWhenDone(string $key): void
+    {
+        if (!str_starts_with($key, 'co:') || isset($this->deferred[$key])) {
+            return;
+        }
+        foreach (['Swoole\\Coroutine', 'OpenSwoole\\Coroutine'] as $class) {
+            if (class_exists($class, false) && method_exists($class, 'defer')) {
+                $this->deferred[$key] = true;
+                $states = &$this->states;
+                $deferred = &$this->deferred;
+                $class::defer(static function () use (&$states, &$deferred, $key): void {
+                    unset($states[$key], $deferred[$key]);
+                });
+
+                return;
+            }
+        }
+    }
+
+    /**
+     * Tells watch-php which request context the running code belongs to, for concurrent runtimes it
+     * doesn't know (Swoole and OpenSwoole coroutines are detected by themselves). Null: the default.
+     * Call releaseContext() when each such request is done (also when it failed), or its state stays.
+     *
+     * @param (\Closure(): string)|null $resolver returns an ID that is the same for the whole request
+     */
+    public static function resolveContextWith(?\Closure $resolver): void
+    {
+        self::$contextResolver = $resolver;
+    }
+
+    /**
+     * Forgets the running request's state (its request data, user, context and breadcrumbs) once the
+     * request is done. The PSR-15 middleware calls it; with resolveContextWith() call it yourself
+     * after endRequest(). In a worker (RoadRunner, FrankenPHP) the finished request's data is replaced by
+     * an empty state, so nothing logged between requests is put on the last one. Does nothing under
+     * PHP-FPM (the process's one request is still running).
+     */
+    public function releaseContext(): void
+    {
+        try {
+            $key = self::contextKey();
+            if ($key !== 'main') {
+                unset($this->states[$key]);
+            } elseif ($this->bufferMode) {
+                $this->states[$key] = new RequestState(Request::detached(), new Scope(), null, hrtime(true));
+            }
+        } catch (\Throwable $failure) {
+            Diagnostics::log('could not release the request context: ' . $failure->getMessage());
+        }
+    }
+
+    /**
+     * How many request states are kept (for tests).
+     *
+     * @internal
+     */
+    public function contextCount(): int
+    {
+        return count($this->states);
     }
 
     private function hasPending(): bool
@@ -609,7 +771,7 @@ final class Client
      */
     private function flushBuffers(): void
     {
-        if ($this->sending) {
+        if ($this->sending > 0) {
             return;
         }
         $this->lastFlush = microtime(true);
@@ -625,7 +787,9 @@ final class Client
             $this->deliverMetrics($payload);
         }
         if ($this->bufferMode) {
-            $this->warnings = [];
+            $this->state()->warnings = [];
+            // Long-running workers and CLI scripts: report packages at the first flush, then daily.
+            $this->maybeReportDependencies();
         }
     }
 
@@ -656,13 +820,17 @@ final class Client
         }
     }
 
+    /**
+     * Sends due files until the budget is used up. What isn't sent stays in the spool for the next
+     * request (not a failure: no retry delay).
+     */
     private function sendSpoolKind(string $kind, int $now, float $deadline): bool
     {
         foreach ($this->spool->dueFiles($kind, $now) as $file) {
-            if (microtime(true) > $deadline) {
+            if ($this->outOfTime($deadline)) {
                 return true;
             }
-            $ok = $kind === 'metrics' ? $this->sendMetricsFile($file) : $this->sendLogsFile($file);
+            $ok = $kind === 'metrics' ? $this->sendMetricsFile($file, $deadline) : $this->sendLogsFile($file, $deadline);
             if (!$ok) {
                 return false;
             }
@@ -671,7 +839,21 @@ final class Client
         return true;
     }
 
-    private function sendMetricsFile(string $file): bool
+    /**
+     * The time a send should have left before it starts: the configured timeout, capped well inside
+     * the send budget (a timeout of 15 s or more would otherwise never fit).
+     */
+    private function fullSendTime(): float
+    {
+        return min($this->config->timeout, self::SEND_BUDGET / 3);
+    }
+
+    private function outOfTime(float $deadline): bool
+    {
+        return $deadline - ($this->clock)() < self::MIN_SEND_TIME;
+    }
+
+    private function sendMetricsFile(string $file, float $deadline): bool
     {
         $metrics = new Metrics();
         foreach ($this->spool->read($file) as $record) {
@@ -682,9 +864,16 @@ final class Client
 
             return true;
         }
-        $result = $this->deliverMetrics($metrics->payload($this->config, Spool::minuteOf($file)));
+        // A send cut short by the budget would time out and count as "maybe stored" (the file is then
+        // deleted): only start one with the full timeout left, else leave the file for the next run.
+        if ($deadline - ($this->clock)() < $this->fullSendTime()) {
+            return true;
+        }
+        $result = $this->deliverMetrics($metrics->payload($this->config, Spool::minuteOf($file)), $deadline);
         if ($result->shouldRetry() && !$result->timedOut) {
-            return false;
+            // Not sent: the file stays for the next try. Running out of the send budget isn't a
+            // failure (the next request carries on, without the retry delay).
+            return $this->outOfTime($deadline);
         }
         // Sent, refused, or maybe stored after a timeout: never send numbers that add up twice.
         $this->spool->delete($file);
@@ -692,15 +881,26 @@ final class Client
         return true;
     }
 
-    private function sendLogsFile(string $file): bool
+    private function sendLogsFile(string $file, float $deadline): bool
     {
         $chunks = array_chunk($this->spool->read($file), $this->config->batchSize);
+        $last = count($chunks) - 1;
         foreach ($chunks as $index => $chunk) {
-            $result = $this->deliver(Transport::LOGS, ['entries' => $chunk], 0);
+            // The budget is checked before every batch; what isn't sent stays in the file.
+            if ($this->outOfTime($deadline)) {
+                return true;
+            }
+            $result = $this->deliver(Transport::LOGS, ['entries' => $chunk], 0, $deadline);
             if ($result->shouldRetry()) {
-                $this->spool->rewrite($file, array_merge(...array_slice($chunks, $index)));
+                return $this->outOfTime($deadline);
+            }
+            // Accepted (or refused for good): the file keeps only what comes after, so a later run
+            // (also after this process is killed) doesn't send a batch twice.
+            if ($index < $last && !$this->spool->rewrite($file, array_merge(...array_slice($chunks, $index + 1)))) {
+                // Keep the file (nothing is lost) and stop: the next run may resend what went already.
+                Diagnostics::log('could not update spool file ' . basename($file));
 
-                return false;
+                return true;
             }
         }
         $this->spool->delete($file);
@@ -713,11 +913,11 @@ final class Client
      *
      * @param array<string, mixed> $payload
      */
-    private function deliverMetrics(array $payload): Result
+    private function deliverMetrics(array $payload, ?float $deadline = null): Result
     {
-        $result = $this->deliver(Transport::METRICS, $payload, 0);
+        $result = $this->deliver(Transport::METRICS, $payload, 0, $deadline);
         if ($result->shouldRetry() && !$result->timedOut) {
-            $result = $this->deliver(Transport::METRICS, $payload, 0);
+            $result = $this->deliver(Transport::METRICS, $payload, 0, $deadline);
         }
 
         return $result;
@@ -725,15 +925,23 @@ final class Client
 
     /**
      * @param array<string, mixed> $payload
+     * @param float|null $deadline with a deadline (the spool's send budget), no request starts with
+     *   less than MIN_SEND_TIME left, and each request may only take the time that is left
      */
-    private function deliver(string $path, array $payload, int $retries): Result
+    private function deliver(string $path, array $payload, int $retries, ?float $deadline = null): Result
     {
-        $wasSending = $this->sending;
-        $this->sending = true;
+        $this->sending++;
         try {
             $attempt = 0;
             while (true) {
-                $result = $this->transport->post($path, $payload);
+                $timeout = null;
+                if ($deadline !== null) {
+                    $timeout = $deadline - ($this->clock)();
+                    if ($timeout < self::MIN_SEND_TIME) {
+                        return Result::retry('send budget used up');
+                    }
+                }
+                $result = $this->transport->post($path, $payload, $timeout);
                 if ($result->isOk()) {
                     return $result;
                 }
@@ -749,28 +957,73 @@ final class Client
         } catch (\Throwable $failure) {
             return Result::drop($failure->getMessage());
         } finally {
-            $this->sending = $wasSending;
+            $this->sending--;
         }
     }
 
-    private function maybeReportDependencies(): void
+    /**
+     * Reports the installed packages when they changed, and at most once a day otherwise. With a
+     * spool, its state file says when (shared by all processes). Without one (a CLI app: the CLI never
+     * creates the spool directory), a small state folder next to it does the same, so a cron script
+     * that runs every minute doesn't report every minute. This process also remembers it, so a
+     * long-running worker checks at most once a day (an hour later after a failed try).
+     *
+     * @param float|null $deadline the spool's send budget: skipped when it is used up
+     */
+    private function maybeReportDependencies(?float $deadline = null): void
     {
         try {
-            if (!$this->config->reportDependencies || !$this->spool->usable($this->web)) {
+            if (!$this->config->reportDependencies) {
+                return;
+            }
+            if ($deadline !== null && $deadline - ($this->clock)() < $this->fullSendTime()) {
                 return;
             }
             $now = time();
-            $payload = Dependencies::due($this->config, $this->spool, $now);
-            if ($payload === null) {
+            if ($this->dependenciesSentAt !== null && $now - $this->dependenciesSentAt < Dependencies::INTERVAL) {
                 return;
             }
-            $result = $this->deliver(Transport::DEPENDENCIES, $payload, 0);
-            if (!$result->shouldRetry()) {
-                Dependencies::markSent($this->config, $this->spool, $payload, $now);
+            if ($this->spool->usable($this->web)) {
+                $sent = $this->reportDependenciesWith($this->spool, $now, $deadline);
+                // A web request lives once; a worker checks again a day later (an hour after a failure).
+                $this->dependenciesSentAt = $sent ? $now : $now - Dependencies::INTERVAL + 3600;
+
+                return;
             }
+            // A web request without a spool can't remember anything between requests: it would report on
+            // every request, so it doesn't report at all (the CLI command `watch dependencies` still can).
+            if ($this->web && !$this->bufferMode) {
+                return;
+            }
+            $state = new Spool(rtrim($this->spool->dir(), '/\\') . '-state');
+            if ($state->usable(true)) {
+                $sent = $this->reportDependenciesWith($state, $now, $deadline);
+            } else {
+                $payload = Dependencies::payload($this->config);
+                $sent = $payload === null || !$this->deliver(Transport::DEPENDENCIES, $payload, 0, $deadline)->shouldRetry();
+            }
+            $this->dependenciesSentAt = $sent ? $now : $now - Dependencies::INTERVAL + 3600;
         } catch (\Throwable $failure) {
             Diagnostics::log('could not report dependencies: ' . $failure->getMessage());
         }
+    }
+
+    /**
+     * Sends the packages when the state in $state says they are due. False when a send failed.
+     */
+    private function reportDependenciesWith(Spool $state, int $now, ?float $deadline): bool
+    {
+        $payload = Dependencies::due($this->config, $state, $now);
+        if ($payload === null) {
+            return true;
+        }
+        $result = $this->deliver(Transport::DEPENDENCIES, $payload, 0, $deadline);
+        if ($result->shouldRetry()) {
+            return false;
+        }
+        Dependencies::markSent($this->config, $state, $payload, $now);
+
+        return true;
     }
 
     /**
@@ -791,37 +1044,37 @@ final class Client
 
     private function durationMs(): float
     {
-        if ($this->serverStart !== null) {
-            return max(0.0, (microtime(true) - $this->serverStart) * 1000);
+        if ($this->state()->serverStart !== null) {
+            return max(0.0, (microtime(true) - $this->state()->serverStart) * 1000);
         }
 
-        return max(0.0, (hrtime(true) - $this->startHr) / 1e6);
+        return max(0.0, (hrtime(true) - $this->state()->startHr) / 1e6);
     }
 
     private function endpoint(): string
     {
-        $method = $this->request->method();
+        $method = $this->state()->request->method();
 
-        return Request::routeName($this->scope->route, $method) ?? Request::endpoint($method, $this->request->path());
+        return Request::routeName($this->state()->scope->route, $method) ?? Request::endpoint($method, $this->state()->request->path());
     }
 
     private function logRequest(string $endpoint, int $code, float $ms): void
     {
-        $method = $this->request->method();
-        $message = $method . ' ' . $this->request->path() . ' ' . $code . ' in ' . (int) round($ms) . 'ms';
-        $route = Request::routeName($this->scope->route, $method);
+        $method = $this->state()->request->method();
+        $message = $method . ' ' . $this->state()->request->path() . ' ' . $code . ' in ' . (int) round($ms) . 'ms';
+        $route = Request::routeName($this->state()->scope->route, $method);
         if ($route !== null) {
             $message .= ' (' . $route . ')';
         }
         $this->log($code >= 500 ? 'error' : 'info', $message, [
             'event' => 'request',
             'method' => $method,
-            'path' => $this->filter->url($this->request->pathWithQuery()),
+            'path' => $this->filter->url($this->state()->request->pathWithQuery()),
             'status' => $code,
             'duration_ms' => round($ms, 1),
             'endpoint' => $endpoint,
-            'db_ms' => $this->scope->dbMs > 0 ? round($this->scope->dbMs, 1) : null,
-            'http_ms' => $this->scope->httpMs > 0 ? round($this->scope->httpMs, 1) : null,
+            'db_ms' => $this->state()->scope->dbMs > 0 ? round($this->state()->scope->dbMs, 1) : null,
+            'http_ms' => $this->state()->scope->httpMs > 0 ? round($this->state()->scope->httpMs, 1) : null,
         ]);
     }
 

@@ -13,7 +13,7 @@ use SyncRecord\Watch\Http\HttpSender;
  */
 final class FakeSender implements HttpSender
 {
-    /** @var list<array{url: string, headers: array<string, string>, body: string}> */
+    /** @var list<array{url: string, headers: array<string, string>, body: string, timeout: float|null}> */
     public array $requests = [];
 
     /** @var list<HttpResponse> */
@@ -28,9 +28,9 @@ final class FakeSender implements HttpSender
         return $this;
     }
 
-    public function send(string $url, array $headers, string $body): HttpResponse
+    public function send(string $url, array $headers, string $body, ?float $timeout = null): HttpResponse
     {
-        $this->requests[] = ['url' => $url, 'headers' => $headers, 'body' => $body];
+        $this->requests[] = ['url' => $url, 'headers' => $headers, 'body' => $body, 'timeout' => $timeout];
 
         return array_shift($this->responses) ?? new HttpResponse(200, 'OK');
     }
