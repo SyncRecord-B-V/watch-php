@@ -3,7 +3,14 @@
     "description": "PHP client for Sync Record Watch: errors, logs, performance, outside API calls, jobs, deploys, heartbeats and vulnerable packages.",
     "type": "library",
     "license": "MIT",
-    "keywords": ["monitoring", "error-tracking", "logging", "apm", "performance", "watch"],
+    "keywords": [
+        "monitoring",
+        "error-tracking",
+        "logging",
+        "apm",
+        "performance",
+        "watch"
+    ],
     "homepage": "https://github.com/SyncRecord-B-V/watch-php",
     "authors": [
         {
@@ -44,5 +51,12 @@
     "config": {
         "sort-packages": true
     },
-    "minimum-stability": "stable"
+    "minimum-stability": "stable",
+    "extra": {
+        "laravel": {
+            "providers": [
+                "SyncRecord\\Watch\\Laravel\\WatchServiceProvider"
+            ]
+        }
+    }
 }

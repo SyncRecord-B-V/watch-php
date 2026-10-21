@@ -64,6 +64,9 @@ final class Client
     /** When dependencies were last reported by this process (no spool to keep it in), or null. */
     private ?int $dependenciesSentAt = null;
 
+    /** The fatal error that ends this process was sent (by the shutdown hook or a framework's handler). */
+    private bool $fatalReported = false;
+
     public function __construct(
         private readonly Config $config,
         ?TransportInterface $transport = null,
@@ -165,6 +168,14 @@ final class Client
             if (!$this->config->sendErrors || isset($this->reported[$error]) || $this->isIgnored($error)) {
                 return;
             }
+            // Laravel and Symfony turn a fatal error into a FatalError exception at shutdown and report it;
+            // Watch's own shutdown hook reports the same fatal error: send it once.
+            if ($this->isTheLastFatal($error)) {
+                if ($this->fatalReported) {
+                    return;
+                }
+                $this->fatalReported = true;
+            }
             $this->reported[$error] = true;
             $notice = ErrorReport::fromThrowable(
                 $this->config,
@@ -193,6 +204,17 @@ final class Client
         $this->notify($error, [], false);
     }
 
+    private function isTheLastFatal(\Throwable $error): bool
+    {
+        if (is_a($error, 'Symfony\\Component\\ErrorHandler\\Error\\FatalError')) {
+            return true;
+        }
+        $last = error_get_last();
+
+        return is_array($last) && in_array($last['type'] ?? null, Handlers::FATAL_TYPES, true)
+            && $error->getFile() === ($last['file'] ?? null) && $error->getLine() === ($last['line'] ?? null);
+    }
+
     /**
      * Called at shutdown for a fatal error from error_get_last().
      *
@@ -206,9 +228,10 @@ final class Client
             if ($this->state()->uncaughtReported && str_starts_with($message, 'Uncaught ')) {
                 return;
             }
-            if (!$this->config->sendErrors) {
+            if (!$this->config->sendErrors || $this->fatalReported) {
                 return;
             }
+            $this->fatalReported = true;
             $this->queueError(ErrorReport::fromFatal($this->config, $this->filter, $error, $this->state()->scope, $this->state()->request));
         } catch (\Throwable $failure) {
             Diagnostics::log('could not report a fatal error: ' . $failure->getMessage());
@@ -256,6 +279,13 @@ final class Client
         try {
             $name = LogEntry::levelName($level);
             $index = LogEntry::levelIndex($name);
+            // Frameworks often catch an exception and only log it (Laravel's queue worker, Symfony's
+            // console, Monolog channels): an error-level line with a PSR-3 "exception" is an error too.
+            // Reported once per exception, also when the framework hook reports it as well.
+            $exception = $context['exception'] ?? null;
+            if ($exception instanceof \Throwable && $index >= 3 && $index <= 4) {
+                $this->notify($exception, [], true);
+            }
             if ($index >= 2) {
                 $this->breadcrumb('log', (string) $message, ['level' => $name]);
             }

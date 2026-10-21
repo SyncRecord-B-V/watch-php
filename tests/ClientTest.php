@@ -60,6 +60,21 @@ final class ClientTest extends TestCase
         $this->assertCount(1, $this->transport->payloads(Transport::ERRORS));
     }
 
+    public function testAnExceptionThatIsOnlyLoggedIsReportedAsAnError(): void
+    {
+        // What a framework does when it catches a failure itself (a queue worker losing Redis).
+        $client = $this->cliClient();
+        $error = new \RuntimeException('Connection refused [tcp://127.0.0.1:6379]');
+        $client->log('error', 'Queue worker could not pop a job', ['exception' => $error]);
+        $client->log('critical', 'Same exception logged again', ['exception' => $error]);
+        $client->log('warning', 'Only a warning', ['exception' => new \RuntimeException('not an error')]);
+
+        $errors = array_merge(...array_column($this->transport->payloads(Transport::ERRORS), 'errors'));
+        $this->assertCount(1, $errors);
+        $this->assertSame('Connection refused [tcp://127.0.0.1:6379]', $errors[0]['message']);
+        $this->assertTrue($errors[0]['handled']);
+    }
+
     public function testIgnoredExceptions(): void
     {
         $client = $this->cliClient(['ignore_errors' => [\DomainException::class]]);

@@ -21,6 +21,9 @@ final class Watch
     private static ?Client $client = null;
     private static bool $started = false;
 
+    /** The last start found no URL or API key (it may be tried again once they are loaded). */
+    private static bool $missingSettings = false;
+
     /**
      * Reads the settings (array, else WATCH_* environment variables), installs the error
      * handlers and the shutdown hook. Returns false when Watch is off (no URL or key, an
@@ -31,11 +34,18 @@ final class Watch
     public static function start(array $options = []): bool
     {
         try {
-            if (self::$started) {
-                return self::$client !== null;
+            // Started already. Only a start that found no URL or key may run again (Laravel loads .env
+            // after public/index.php, so the service provider's start() then finds them); one that was
+            // turned off on purpose (enabled = false) stays off.
+            if (self::$client !== null) {
+                return true;
+            }
+            if (self::$started && !self::$missingSettings) {
+                return false;
             }
             self::$started = true;
             $config = Config::fromArray($options);
+            self::$missingSettings = $config->url === null || $config->apiKey === null;
             Diagnostics::enable($config->diagnostics);
             if (!$config->isEnabled()) {
                 if ($config->url !== null && $config->apiKey !== null && !$config->isSecureUrl()) {
@@ -296,6 +306,7 @@ final class Watch
     {
         self::$client = $client;
         self::$started = $client !== null;
+        self::$missingSettings = false;
     }
 
     private static function ping(string $tokenOrUrl, bool $failed, ?string $message): bool

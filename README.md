@@ -52,7 +52,7 @@ Without `WATCH_URL` or `WATCH_API_KEY` Watch is off and does nothing. It is also
 
 | What | When |
 |---|---|
-| Errors: uncaught exceptions, fatal errors, `Watch::notify()` | At the end of the request, after the visitor has the response (PHP-FPM). At once in CLI scripts and workers. |
+| Errors: uncaught exceptions, fatal errors, exceptions your framework reports (Laravel automatically, Symfony with one line), exceptions logged at error level (PSR-3 `exception`), `Watch::notify()` | At the end of the request, after the visitor has the response (PHP-FPM). At once in CLI scripts and workers. |
 | Logs: `Watch::log()`, `Watch::logger()`, PHP warnings | Written to a small local spool and sent about once a minute per server. |
 | Performance: requests per route, outgoing HTTP per host, jobs per class | Added up per minute in the spool and sent about once a minute per server. |
 | Installed Composer packages, PHP version, framework | When they change, and at most once a day otherwise. |
@@ -153,25 +153,17 @@ as IDs. Paths with slugs (`/blog/my-first-post`) each get their own name, so cal
 
 ### Laravel
 
-Start Watch in `public/index.php`, right after the autoloader:
+Nothing to add for errors: Laravel's package discovery loads `SyncRecord\Watch\Laravel\WatchServiceProvider`,
+which starts Watch in every entry point (web requests, and `php artisan`: queue workers, the scheduler, commands) and
+reports every exception Laravel reports, including the ones the framework catches itself (a Redis or database
+connection failing inside the queue worker). Exceptions in Laravel's "don't report" list (404s, validation errors)
+are skipped. In queue workers and Octane each job or request starts clean (no user, context or breadcrumbs of the one
+before) and errors in a job name the job. Settings are read through `config/watch.php` (`env()`), so they also work
+after `php artisan config:cache`; publish it with `php artisan vendor:publish --tag=watch-config` to change it.
+`WATCH_LARAVEL=false` turns the provider off.
 
-```php
-require __DIR__.'/../vendor/autoload.php';
-
-SyncRecord\Watch\Watch::start();
-```
-
-Laravel installs its own exception handler, so report exceptions from `bootstrap/app.php` (Laravel 11 and 12):
-
-```php
-use SyncRecord\Watch\Watch;
-
-->withExceptions(function (Illuminate\Foundation\Configuration\Exceptions $exceptions) {
-    $exceptions->report(function (Throwable $e) {
-        Watch::notify($e, [], handled: false);
-    });
-})
-```
+You don't need `Watch::start()` in `public/index.php` for Laravel (your `.env` isn't loaded yet at that point; the
+provider starts Watch right after it is). If you added a `$exceptions->report(...)` hook for Watch before, you can remove it (each exception is sent once anyway).
 
 Name requests and set the user in a middleware or a service provider:
 
@@ -227,12 +219,21 @@ Run `vendor/bin/watch deploy` in your deploy script.
 
 ### Symfony
 
-Start Watch in `public/index.php` before the kernel boots. Symfony's ErrorHandler takes over PHP's
-handlers, so report exceptions from a `kernel.exception` listener:
+Symfony's ErrorHandler takes over PHP's handlers, so exceptions reach Watch through Symfony's events. Register the
+subscriber once in `config/services.yaml`; it reports exceptions in requests (`kernel.exception`) and console commands
+(`console.error`, so also Messenger workers and cron commands), and starts Watch at the start of each request and
+command if `public/index.php` or `bin/console` didn't. Like Symfony's own log, it skips HTTP exceptions under 500 (404,
+403...) and security exceptions that become a login redirect:
+
+```yaml
+services:
+    SyncRecord\Watch\Symfony\WatchExceptionSubscriber: ~
+```
+
+To name requests, add a listener of your own (errors are covered by the subscriber):
 
 ```php
 use Symfony\Component\EventDispatcher\Attribute\AsEventListener;
-use Symfony\Component\HttpKernel\Event\ExceptionEvent;
 use Symfony\Component\HttpKernel\Event\RequestEvent;
 use SyncRecord\Watch\Watch;
 
@@ -246,16 +247,10 @@ final class WatchListener
             Watch::setRoute($controller);   // "App\Controller\InvoiceController::show"
         }
     }
-
-    #[AsEventListener]
-    public function onException(ExceptionEvent $event): void
-    {
-        Watch::notify($event->getThrowable(), [], handled: false);
-    }
 }
 ```
 
-If your stack is PSR-15 based, `SyncRecord\Watch\Adapter\Psr15Middleware` does both.
+If your stack is PSR-15 based, `SyncRecord\Watch\Adapter\Psr15Middleware` names requests and reports their errors.
 
 ### Slim
 

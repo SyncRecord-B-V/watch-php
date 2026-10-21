@@ -49,3 +49,11 @@ First version.
   request's data, and Swoole registers its cleanup once per coroutine (keep-alive connections).
 - Oversized header names are skipped before they are lowercased or reformatted (outgoing quota headers,
   incoming request headers).
+- More errors reach Watch:
+  - Laravel: an auto-discovered service provider starts Watch in every entry point (also `php artisan`: queue
+    workers, the scheduler) and reports every exception Laravel reports, including ones the framework catches
+    itself, like a Redis connection failing in the queue worker. `WATCH_LARAVEL=false` turns it off.
+  - Symfony: `SyncRecord\Watch\Symfony\WatchExceptionSubscriber` (one line in services.yaml) reports request and
+    console exceptions.
+  - Any framework: a log line at error level or above with a PSR-3 `exception` is also reported as an error
+    (once per exception).
